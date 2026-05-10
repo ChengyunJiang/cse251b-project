@@ -1,0 +1,17 @@
+# training outputs
+out*/
+*.pt
+*.pth
+*.ckpt
+
+# tokenized data
+*.bin
+
+# cache
+__pycache__/
+*.pyc
+.DS_Store
+
+# logs
+wandb/
+*.log
