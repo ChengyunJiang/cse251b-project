@@ -186,8 +186,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x)
             loss = None
 
         return logits, loss
@@ -328,3 +327,29 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+        
+def load_model(checkpoint_path: str, device: str = "cuda"):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_args = checkpoint["model_args"]
+    model = GPT(GPTConfig(**model_args))
+    state_dict = checkpoint["model"]
+
+    unwanted_prefix = "_orig_mod."
+    for k in list(state_dict.keys()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    class EvalWrapper(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, input_ids):
+            logits, _ = self.model(input_ids)
+            return logits[:, :, :50257]
+
+    return EvalWrapper(model)
