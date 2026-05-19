@@ -26,6 +26,33 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    def __init__(self, ndim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+
+    def forward(self, x):
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+def precompute_rope_cache(seq_len, head_dim, device, base=10000):
+    assert head_dim % 2 == 0
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    cos = freqs.cos()[None, None, :, :]
+    sin = freqs.sin()[None, None, :, :]
+    return cos, sin
+
+def apply_rope(x, cos, sin):
+    # x: (B, n_head, T, head_dim)
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    x_rope = torch.empty_like(x)
+    x_rope[..., 0::2] = x_even * cos - x_odd * sin
+    x_rope[..., 1::2] = x_even * sin + x_odd * cos
+    return x_rope
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -58,6 +85,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        cos, sin = precompute_rope_cache(T, C // self.n_head, x.device)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -75,18 +106,36 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+# class MLP(nn.Module):
+
+#     def __init__(self, config):
+#         super().__init__()
+#         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+#         self.gelu    = nn.GELU()
+#         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+#         self.dropout = nn.Dropout(config.dropout)
+
+#     def forward(self, x):
+#         x = self.c_fc(x)
+#         x = self.gelu(x)
+#         x = self.c_proj(x)
+#         x = self.dropout(x)
+#         return x
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        hidden_dim = int(8 * config.n_embd / 3)
+        hidden_dim = 256 * ((hidden_dim + 255) // 256)  # round up for efficiency
+
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
+        self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
+        x = F.silu(self.c_gate(x)) * self.c_fc(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -95,9 +144,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -109,11 +158,11 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 10
-    n_head: int = 10
-    n_embd: int = 640
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 672
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
 
@@ -125,10 +174,10 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            #wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -155,8 +204,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        # if non_embedding:
+        #     n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -171,12 +220,15 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # # forward the GPT model itself
+        # tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb = self.transformer.wte(idx)
+        x = self.transformer.drop(tok_emb)
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -197,7 +249,7 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        #self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
