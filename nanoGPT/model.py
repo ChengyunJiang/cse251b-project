@@ -26,15 +26,6 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class RMSNorm(nn.Module):
-    def __init__(self, ndim, eps=1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.eps = eps
-
-    def forward(self, x):
-        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
 def precompute_rope_cache(seq_len, head_dim, device, base=10000):
     assert head_dim % 2 == 0
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
@@ -106,36 +97,18 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-# class MLP(nn.Module):
-
-#     def __init__(self, config):
-#         super().__init__()
-#         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-#         self.gelu    = nn.GELU()
-#         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-#         self.dropout = nn.Dropout(config.dropout)
-
-#     def forward(self, x):
-#         x = self.c_fc(x)
-#         x = self.gelu(x)
-#         x = self.c_proj(x)
-#         x = self.dropout(x)
-#         return x
-
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        hidden_dim = int(8 * config.n_embd / 3)
-        hidden_dim = 256 * ((hidden_dim + 255) // 256)  # round up for efficiency
-
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = F.silu(self.c_gate(x)) * self.c_fc(x)
+        x = self.c_fc(x)
+        x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -144,9 +117,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -177,7 +150,7 @@ class GPT(nn.Module):
             #wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
